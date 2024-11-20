@@ -199,12 +199,10 @@ func (r *NotebookReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Reconcile virtual service if we use ISTIO.
-	if os.Getenv("USE_ISTIO") == "true" {
-		err = r.reconcileVirtualService(instance)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	// Reconcile network resource (e.g. VirtualService, HTTPRoute)
+	err = r.reconcileNetworkResource(instance)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	foundPod := &corev1.Pod{}
@@ -464,7 +462,7 @@ func generateService(instance *v1beta1.Notebook) *corev1.Service {
 	return svc
 }
 
-func virtualServiceName(kfName string, namespace string) string {
+func networkResourceServiceName(kfName string, namespace string) string {
 	return fmt.Sprintf("notebook-%s-%s", namespace, kfName)
 }
 
@@ -494,7 +492,7 @@ func generateVirtualService(instance *v1beta1.Notebook) (*unstructured.Unstructu
 	vsvc := &unstructured.Unstructured{}
 	vsvc.SetAPIVersion("networking.istio.io/v1alpha3")
 	vsvc.SetKind("VirtualService")
-	vsvc.SetName(virtualServiceName(name, namespace))
+	vsvc.SetName(networkResourceServiceName(name, namespace))
 	vsvc.SetNamespace(namespace)
 
 	istioHost := os.Getenv("ISTIO_HOST")
@@ -570,41 +568,128 @@ func generateVirtualService(instance *v1beta1.Notebook) (*unstructured.Unstructu
 
 }
 
-func (r *NotebookReconciler) reconcileVirtualService(instance *v1beta1.Notebook) error {
-	log := r.Log.WithValues("notebook", instance.Namespace)
-	virtualService, err := generateVirtualService(instance)
+func generateHttpRoute(instance *v1beta1.Notebook) (*unstructured.Unstructured, error) {
+	name := instance.Name
+	namespace := instance.Namespace
+	prefix := fmt.Sprintf("/notebook/%s/%s/", namespace, name)
+
+	hrvc := &unstructured.Unstructured{}
+	hrvc.SetAPIVersion("gateway.networking.k8s.io/v1")
+	hrvc.SetKind("HTTPRoute")
+	hrvc.SetName(networkResourceServiceName(name, namespace))
+	hrvc.SetNamespace(namespace)
+
+	istioGateway := os.Getenv("ISTIO_GATEWAY")
+	if len(istioGateway) == 0 {
+		istioGateway = "kubeflow/kubeflow-gateway"
+	}
+	parts := strings.Split(istioGateway, "/")
+	gatewayNamespace, gatewayName := parts[0], parts[1]
+
+	parentRefs := []interface{}{
+		map[string]interface{}{
+			"group":     "gateway.networking.k8s.io",
+			"kind":      "Gateway",
+			"name":      gatewayName,
+			"namespace": gatewayNamespace,
+		},
+	}
+	if err := unstructured.SetNestedSlice(hrvc.Object, parentRefs, "spec", "parentRefs"); err != nil {
+		return nil, fmt.Errorf("set .spec.parentRefs error: %v", err)
+	}
+	rules := []interface{}{
+		map[string]interface{}{
+			"backendRefs": []interface{}{
+				map[string]interface{}{
+					"group": "",
+					"kind":  "Service",
+					"name":  name,
+					"port":  int64(DefaultServingPort),
+				},
+			},
+			"matches": []interface{}{
+				map[string]interface{}{
+					"path": map[string]interface{}{
+						"type":  "PathPrefix",
+						"value": prefix,
+					},
+				},
+			},
+		},
+	}
+
+	if err := unstructured.SetNestedSlice(hrvc.Object, rules, "spec", "rules"); err != nil {
+		return nil, fmt.Errorf("set .spec.rules error: %v", err)
+	}
+	return hrvc, nil
+
+}
+
+func (r *NotebookReconciler) reconcileNetworkResource(instance *v1beta1.Notebook) error {
+	log := r.Log.WithValues("notebook", instance.Namespace, "name", instance.Name)
+
+	var generateNetworkResourceFunc func(*v1beta1.Notebook) (*unstructured.Unstructured, error)
+
+	// istio is set to a higher priority
+	if os.Getenv("USE_ISTIO") == "true" {
+		log.Info("Using Istio configuration, generating VirtualService")
+		generateNetworkResourceFunc = generateVirtualService
+	} else if os.Getenv("USE_GATEWAY") == "true" {
+		log.Info("Using Gateway API configuration, generating HTTPRoute")
+		generateNetworkResourceFunc = generateHttpRoute
+	} else {
+		return nil
+	}
+
+	networkResource, err := generateNetworkResourceFunc(instance)
 	if err != nil {
-		log.Info("Unable to generate VirtualService...", err)
-		return err
-	}
-	if err := ctrl.SetControllerReference(instance, virtualService, r.Scheme); err != nil {
-		return err
-	}
-	// Check if the virtual service already exists.
-	foundVirtual := &unstructured.Unstructured{}
-	justCreated := false
-	foundVirtual.SetAPIVersion("networking.istio.io/v1alpha3")
-	foundVirtual.SetKind("VirtualService")
-	err = r.Get(context.TODO(), types.NamespacedName{Name: virtualServiceName(instance.Name,
-		instance.Namespace), Namespace: instance.Namespace}, foundVirtual)
-	if err != nil && apierrs.IsNotFound(err) {
-		log.Info("Creating virtual service", "namespace", instance.Namespace, "name",
-			virtualServiceName(instance.Name, instance.Namespace))
-		err = r.Create(context.TODO(), virtualService)
-		justCreated = true
-		if err != nil {
-			return err
-		}
-	} else if err != nil {
+		log.Error(err, "Failed to generate network resource")
 		return err
 	}
 
-	if !justCreated && reconcilehelper.CopyVirtualService(virtualService, foundVirtual) {
-		log.Info("Updating virtual service", "namespace", instance.Namespace, "name",
-			virtualServiceName(instance.Name, instance.Namespace))
-		err = r.Update(context.TODO(), foundVirtual)
-		if err != nil {
-			return err
+	if err := ctrl.SetControllerReference(instance, networkResource, r.Scheme); err != nil {
+		log.Error(err, "Failed to set controller reference")
+		return err
+	}
+
+	if err := r.createOrUpdateNetworkResource(instance, networkResource); err != nil {
+		log.Error(err, "Failed to reconcile network resource")
+		return err
+	}
+
+	return nil
+}
+
+func (r *NotebookReconciler) createOrUpdateNetworkResource(instance *v1beta1.Notebook, networkResource *unstructured.Unstructured) error {
+	log := r.Log.WithValues("notebook", instance.Namespace)
+
+	name := types.NamespacedName{
+		Name:      networkResource.GetName(),
+		Namespace: instance.Namespace,
+	}
+	foundResource := &unstructured.Unstructured{}
+	foundResource.SetAPIVersion(networkResource.GetAPIVersion())
+	foundResource.SetKind(networkResource.GetKind())
+
+	err := r.Get(context.TODO(), name, foundResource)
+	if err != nil {
+		if apierrs.IsNotFound(err) {
+			log.Info("Creating network resource", "namespace", instance.Namespace, "name", name.Name)
+			if createErr := r.Create(context.TODO(), networkResource); createErr != nil {
+				log.Error(createErr, "Failed to create network resource")
+				return createErr
+			}
+			return nil
+		}
+		log.Error(err, "Failed to get network resource")
+		return err
+	}
+
+	if reconcilehelper.CopyNetworkService(networkResource, foundResource) {
+		log.Info("Updating network resource", "namespace", instance.Namespace, "name", name.Name)
+		if updateErr := r.Update(context.TODO(), foundResource); updateErr != nil {
+			log.Error(updateErr, "Failed to update network resource")
+			return updateErr
 		}
 	}
 

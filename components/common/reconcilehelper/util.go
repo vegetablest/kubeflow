@@ -89,7 +89,7 @@ func VirtualService(ctx context.Context, r client.Client, virtualServiceName, na
 			return err
 		}
 	}
-	if !justCreated && CopyVirtualService(virtualservice, foundVirtualService) {
+	if !justCreated && CopyNetworkService(virtualservice, foundVirtualService) {
 		log.Info("Updating virtual service", "namespace", namespace, "name", virtualServiceName)
 		if err := r.Update(ctx, foundVirtualService); err != nil {
 			log.Error(err, "unable to update virtual service")
@@ -196,7 +196,7 @@ func CopyServiceFields(from, to *corev1.Service) bool {
 
 // Copy configuration related fields to another instance and returns true if there
 // is a diff and thus needs to update.
-func CopyVirtualService(from, to *unstructured.Unstructured) bool {
+func CopyNetworkService(from, to *unstructured.Unstructured) bool {
 	fromSpec, found, err := unstructured.NestedMap(from.Object, "spec")
 	if !found {
 		return false
