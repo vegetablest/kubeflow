@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -132,8 +133,8 @@ func (r *PVCViewerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileVirtualService(ctx, log, instance, commonLabels); err != nil {
-		log.Error(err, "Error while reconciling virtual service")
+	if err := r.reconcileNetworkResource(ctx, log, instance, commonLabels); err != nil {
+		log.Error(err, "Error while reconciling network resource")
 		return ctrl.Result{}, err
 	}
 
@@ -249,91 +250,6 @@ func (r *PVCViewerReconciler) reconcileService(ctx context.Context, log logr.Log
 	return r.Update(ctx, service)
 }
 
-func (r *PVCViewerReconciler) reconcileVirtualService(ctx context.Context, log logr.Logger, viewer *kubefloworgv1alpha1.PVCViewer, commonLabels map[string]string) error {
-	if viewer.Spec.Networking == (kubefloworgv1alpha1.Networking{}) {
-		return nil
-	}
-
-	virtualService := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "networking.istio.io/v1alpha3",
-			"kind":       "VirtualService",
-			"metadata": map[string]interface{}{
-				"name":      resourcePrefix + viewer.Name,
-				"namespace": viewer.Namespace,
-				"labels":    commonLabels,
-			},
-		},
-	}
-	createVirtualService := false
-	if err := r.Get(ctx, types.NamespacedName{Name: virtualService.GetName(), Namespace: virtualService.GetNamespace()}, virtualService); err != nil {
-		if !apierrs.IsNotFound(err) {
-			return err
-		}
-		createVirtualService = true
-	}
-
-	prefix := fmt.Sprintf("%s/%s/%s/", viewer.Spec.Networking.BasePrefix, viewer.Namespace, viewer.Name)
-	rewrite := prefix
-	if viewer.Spec.Networking.Rewrite != "" {
-		rewrite = viewer.Spec.Networking.Rewrite
-	}
-	service := fmt.Sprintf("%s%s.%s.svc.cluster.local", resourcePrefix, viewer.Name, viewer.Namespace)
-	var timeout *string = nil
-	if viewer.Spec.Networking.Timeout != "" {
-		timeout = &viewer.Spec.Networking.Timeout
-	}
-
-	// Get the istio gateway from the environment variable or use the default
-	istioGateway := os.Getenv(istioGatewayEnvKey)
-	if istioGateway == "" {
-		istioGateway = defaultIstioGateway
-	}
-
-	virtualService.Object["spec"] = map[string]interface{}{
-		"hosts": []string{"*"},
-		"gateways": []string{
-			istioGateway,
-		},
-		"http": []interface{}{
-			map[string]interface{}{
-				"match": []interface{}{
-					map[string]interface{}{
-						"uri": map[string]interface{}{
-							"prefix": prefix,
-						},
-					},
-				},
-				"rewrite": map[string]interface{}{
-					"uri": rewrite,
-				},
-				"route": []interface{}{
-					map[string]interface{}{
-						"destination": map[string]interface{}{
-							"host": service,
-							"port": map[string]interface{}{
-								"number": int64(servicePort),
-							},
-						},
-					},
-				},
-				"timeout": timeout,
-			},
-		},
-	}
-
-	if err := ctrl.SetControllerReference(viewer, virtualService, r.Scheme); err != nil {
-		return err
-	}
-
-	if createVirtualService {
-		log.Info("Creating Virtual Service")
-		return r.Create(ctx, virtualService)
-	}
-	log.Info("Updating Virtual Service")
-	return r.Update(ctx, virtualService)
-}
-
 // Computes and updates the status of the PVCViewer
 func (r *PVCViewerReconciler) reconcileStatus(ctx context.Context, log logr.Logger, viewerName string, viewerNamespace string) error {
 	viewer := &kubefloworgv1alpha1.PVCViewer{}
@@ -365,6 +281,176 @@ func (r *PVCViewerReconciler) reconcileStatus(ctx context.Context, log logr.Logg
 
 	log.Info("Updating status")
 	return r.Client.Status().Update(ctx, viewer)
+}
+
+func (r *PVCViewerReconciler) reconcileNetworkResource(ctx context.Context, log logr.Logger, viewer *kubefloworgv1alpha1.PVCViewer, commonLabels map[string]string) error {
+	if viewer.Spec.Networking == (kubefloworgv1alpha1.Networking{}) {
+		return nil
+	}
+
+	var generateNetworkResourceFunc func(*kubefloworgv1alpha1.PVCViewer, string) (*unstructured.Unstructured, error)
+
+	if os.Getenv("USE_GATEWAY") == "true" {
+		log.Info("Using Gateway API configuration, generating HTTPRoute")
+		generateNetworkResourceFunc = generateHttpRoute
+	} else {
+		// This is the default behavior, I didn't make any changes.
+		log.Info("Using Istio configuration, generating VirtualService")
+		generateNetworkResourceFunc = generateVirtualService
+	}
+
+	istioGateway := os.Getenv(istioGatewayEnvKey)
+	if istioGateway == "" {
+		istioGateway = defaultIstioGateway
+	}
+
+	networkResource, err := generateNetworkResourceFunc(viewer, istioGateway)
+	if networkResource == nil {
+		log.Error(fmt.Errorf("network resource generation failed"), "Network resource is nil")
+		return fmt.Errorf("failed to generate network resource")
+	}
+
+	networkResource.SetLabels(commonLabels)
+	networkResource.SetName(resourcePrefix + viewer.Name)
+	networkResource.SetNamespace(viewer.Namespace)
+
+	if err != nil {
+		log.Error(err, "Failed to generate network resource")
+		return err
+	}
+
+	if err := ctrl.SetControllerReference(viewer, networkResource, r.Scheme); err != nil {
+		log.Error(err, "Failed to set controller reference")
+		return err
+	}
+
+	if err := r.createOrUpdateNetworkResource(ctx, log, networkResource); err != nil {
+		log.Error(err, "Failed to reconcile network resource")
+		return err
+	}
+
+	return nil
+}
+
+func (r *PVCViewerReconciler) createOrUpdateNetworkResource(ctx context.Context, log logr.Logger, networkResource *unstructured.Unstructured) error {
+	existingResource := &unstructured.Unstructured{}
+	existingResource.SetAPIVersion(networkResource.GetAPIVersion())
+	existingResource.SetKind(networkResource.GetKind())
+
+	err := r.Get(ctx, types.NamespacedName{Name: networkResource.GetName(), Namespace: networkResource.GetNamespace()}, existingResource)
+	if err != nil {
+		if apierrs.IsNotFound(err) {
+			log.Info("Creating network resource", "name", networkResource.GetName(), "namespace", networkResource.GetNamespace())
+			return r.Create(ctx, networkResource)
+		}
+		return err
+	}
+
+	log.Info("Updating network resource", "name", networkResource.GetName(), "namespace", networkResource.GetNamespace())
+	networkResource.SetResourceVersion(existingResource.GetResourceVersion())
+	return r.Update(ctx, networkResource)
+}
+
+func generateVirtualService(viewer *kubefloworgv1alpha1.PVCViewer, istioGateway string) (*unstructured.Unstructured, error) {
+	prefix, rewrite := calculatePrefixes(viewer)
+	service := fmt.Sprintf("%s%s.%s.svc.cluster.local", resourcePrefix, viewer.Name, viewer.Namespace)
+	var timeout *string = nil
+	if viewer.Spec.Networking.Timeout != "" {
+		timeout = &viewer.Spec.Networking.Timeout
+	}
+
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "networking.istio.io/v1alpha3",
+			"kind":       "VirtualService",
+			"spec": map[string]interface{}{
+				"hosts": []string{"*"},
+				"gateways": []string{
+					istioGateway,
+				},
+				"http": []interface{}{
+					map[string]interface{}{
+						"match": []interface{}{
+							map[string]interface{}{
+								"uri": map[string]interface{}{
+									"prefix": prefix,
+								},
+							},
+						},
+						"rewrite": map[string]interface{}{
+							"uri": rewrite,
+						},
+						"route": []interface{}{
+							map[string]interface{}{
+								"destination": map[string]interface{}{
+									"host": service,
+									"port": map[string]interface{}{
+										"number": int64(servicePort),
+									},
+								},
+							},
+						},
+						"timeout": timeout,
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+func generateHttpRoute(viewer *kubefloworgv1alpha1.PVCViewer, istioGateway string) (*unstructured.Unstructured, error) {
+	prefix, _ := calculatePrefixes(viewer)
+	parts := strings.Split(istioGateway, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid istioGateway format: %s", istioGateway)
+	}
+	gatewayNamespace, gatewayName := parts[0], parts[1]
+
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "gateway.networking.k8s.io/v1",
+			"kind":       "HTTPRoute",
+			"spec": map[string]interface{}{
+				"parentRefs": []interface{}{
+					map[string]interface{}{
+						"group":     "gateway.networking.k8s.io",
+						"kind":      "Gateway",
+						"name":      gatewayName,
+						"namespace": gatewayNamespace,
+					},
+				},
+				"rules": []interface{}{
+					map[string]interface{}{
+						"backendRefs": []interface{}{
+							map[string]interface{}{
+								"group": "",
+								"kind":  "Service",
+								"name":  resourcePrefix + viewer.Name,
+								"port":  int64(servicePort),
+							},
+						},
+						"matches": []interface{}{
+							map[string]interface{}{
+								"path": map[string]interface{}{
+									"type":  "PathPrefix",
+									"value": prefix,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+func calculatePrefixes(viewer *kubefloworgv1alpha1.PVCViewer) (string, string) {
+	prefix := fmt.Sprintf("%s/%s/%s/", viewer.Spec.Networking.BasePrefix, viewer.Namespace, viewer.Name)
+	rewrite := prefix
+	if viewer.Spec.Networking.Rewrite != "" {
+		rewrite = viewer.Spec.Networking.Rewrite
+	}
+	return prefix, rewrite
 }
 
 // Generates the affinity to be used for the deployment
